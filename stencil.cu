@@ -74,9 +74,10 @@ template <int K> struct Geo {
 //  Inside the row loop, an iteration is "row-fast" if no level touches a boundary row
 //  (warp-uniform test); only the few iterations near rows 0 / N-1 use the general code.
 // ---------------------------------------------------------------------------------------
-template <int K, int C, int B, bool COLFAST>
+template <int K, int C, int B>
 __device__ __forceinline__ void pass_body(const double* __restrict__ in, double* __restrict__ out,
-                                          int N, int Wout, int H, bool vec) {
+                                          int N, int nS, int strip, int r0, int H, bool vec,
+                                          bool aligned) {
   constexpr int HL = Geo<K>::HL;
   extern __shared__ double smem[];
   // edge buffers: sL[buf][lvl][B+2] (first value of each thread), sR likewise (last value)
@@ -86,13 +87,31 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
   auto SR = [&](int buf, int lvl, int idx) -> double& { return sR[(buf * K + lvl) * (B + 2) + idx]; };
 
   const int t = threadIdx.x;
-  const int j0 = blockIdx.x * Wout;        // first output column of this strip
-  const int jt = j0 - HL;                  // first column held by the block
+  // strip geometry: block holds columns [jt, jt+W), writes output columns [ob, oe)
+  constexpr int W = B * C, Wout = W - 2 * HL;
+  int jt, ob, oe;
+  if (!aligned) {  // small grids: uniform strips, halo may stick out of the grid
+    ob = strip * Wout; jt = ob - HL; oe = min(ob + Wout, N);
+  } else if (strip == 0) {  // first strip starts exactly at column 0 (column 0 is constant)
+    jt = 0; ob = 0; oe = W - HL;
+  } else if (strip == nS - 1) {  // last strip ends exactly at column N-1
+    jt = N - W; ob = N - W + HL; oe = N;
+  } else {
+    jt = W - 2 * HL + (strip - 1) * Wout; ob = jt + HL; oe = min(ob + Wout, N - W + HL);
+  }
+  // the thread holding boundary column 0 / N-1 (aligned strips) restores it from a ring of
+  // its original values instead of running the general boundary code
+  const bool hasL = aligned && jt == 0 && threadIdx.x == 0;
+  const bool hasR = aligned && jt + W == N && threadIdx.x == B - 1;
   const int jc = jt + t * C;               // first column of this thread
-  const int r0 = blockIdx.y * H;           // first output row of this chunk
   const int rs = r0 - K;                   // first input row streamed
   const int rEnd = min(r0 + H, N);         // output rows [r0, rEnd)
-  const bool vecIO = COLFAST && (C % 2 == 0) && vec;
+  __syncthreads();  // previous segment of this block is completely done with smem
+  // per-thread: are all my columns inside the grid?  (vector loads/stores)
+  const bool vecIO = (C % 2 == 0) && vec && (jc >= 0) && (jc + C <= N);
+  // per-warp: are all the warp's columns interior (1..N-2)?  Then no column-boundary logic.
+  const int jw = jt + (t & ~31) * C;
+  const bool warpColFast = aligned || ((jw >= 1) && (jw + 32 * C - 1 <= N - 2));
 
   // zero both buffers (incl. pads)
   for (int i = t; i < 4 * K * (B + 2); i += B) smem[i] = 0.0;
@@ -103,7 +122,7 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
   for (int q = 0; q < C; ++q) {
     int j = jc + q;
     colI[q] = (j >= 1 && j <= N - 2);
-    colOut[q] = (j >= j0 && j < j0 + Wout && j < N);
+    colOut[q] = (j >= ob && j < oe);
   }
 
   double pend[K][C];   // pend[s] = last row produced by level s (consumed by level s+1)
@@ -119,6 +138,7 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
 
   // input rows are prefetched PF rows ahead with cp.async into a per-thread smem ring
   double* sIn = smem + 4 * K * (B + 2);  // [PF][B*C]
+  double* sBnd = sIn + PF * B * C;       // [2][64] original values of columns 0 and N-1
   auto issue_row = [&](int r, int slot) {
     double* dst = sIn + slot * (B * C) + t * C;
     const bool rok = (r >= 0 && r < N);
@@ -134,7 +154,7 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
 #pragma unroll
       for (int q = 0; q < C; ++q) {
         const int j = jc + q;
-        const bool ok = rok && (COLFAST || (j >= 0 && j < N));
+        const bool ok = rok && (j >= 0 && j < N);
         cp_async8(dst + q, ok ? in + (size_t)r * N + j : in, ok ? 8 : 0);
       }
     }
@@ -203,6 +223,8 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
         acc0[s][q] = na;
         acc1[s][q] = C2 * R;
       }
+      if (hasL) o[0] = sBnd[(a - 1) & 63];
+      if (hasR) o[C - 1] = sBnd[64 + ((a - 1) & 63)];
       if (s < K) {
 #pragma unroll
         for (int q = 0; q < C; ++q) pend[s][q] = o[q];
@@ -235,6 +257,8 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
     for (int q = 0; q < C; ++q) pend[0][q] = inrow[q];
     SL(nb, 0, t + 1) = inrow[0];
     SR(nb, 0, t + 1) = inrow[C - 1];
+    if (hasL) sBnd[(rs + it) & 63] = inrow[0];
+    if (hasR) sBnd[64 + ((rs + it) & 63)] = inrow[C - 1];
     if (it + PF < nIt) issue_row(rs + it + PF, slot);
     cp_async_commit();
     slot = (slot + 1 == PF) ? 0 : slot + 1;
@@ -247,20 +271,44 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
   for (int it = 0; it < nIt; ++it) {
     // arriving rows of all levels this iteration: [rs+it-1-2(K-1), rs+it-1]
     const bool rowFast = (rs + it - 1 - 2 * (K - 1) >= 2) && (rs + it - 1 <= N - 2);
-    if (COLFAST && rowFast) iteration(it, std::integral_constant<bool, false>{});
+    if (warpColFast && rowFast) iteration(it, std::integral_constant<bool, false>{});
     else                    iteration(it, std::integral_constant<bool, true>{});
   }
+  cp_async_wait<0>();
 }
 
+// Work decomposition: the nS strips x N rows are laid out as one long list of row-units
+// (strip-major) and cut into gridDim.x equal pieces, one per block, with gridDim.x = number
+// of blocks that are co-resident on the GPU.  So every SM slot gets the same amount of work
+// (no wave quantisation).  A piece may span two strips -> processed as two segments.
 template <int K, int C, int B>
 __global__ void __launch_bounds__(B, MINB)
-pass_kernel(const double* __restrict__ in, double* __restrict__ out, int N, int Wout, int H, int vec) {
-  constexpr int HL = Geo<K>::HL;
-  const int jt = blockIdx.x * Wout - HL;
-  const bool colFast = (jt >= 0) && (jt + B * C <= N);
-  if (colFast) pass_body<K, C, B, true>(in, out, N, Wout, H, vec != 0);
-  else         pass_body<K, C, B, false>(in, out, N, Wout, H, vec != 0);
+pass_kernel(const double* __restrict__ in, double* __restrict__ out, int N, int nS, int vec, int aligned) {
+#ifdef BLKTIME
+  unsigned long long t0; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+#endif
+  const long long U = (long long)nS * N;
+  long long beg = U * blockIdx.x / gridDim.x;
+  const long long end = U * (blockIdx.x + 1) / gridDim.x;
+  while (beg < end) {
+    const int strip = (int)(beg / N);
+    const int r0 = (int)(beg - (long long)strip * N);
+    const int H = (int)(min(end, (long long)(strip + 1) * N) - beg);
+    pass_body<K, C, B>(in, out, N, nS, strip, r0, H, vec != 0, aligned != 0);
+    beg += H;
+  }
+#ifdef BLKTIME
+  if (threadIdx.x == 0) {
+    unsigned long long t1; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+    unsigned smid; asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    extern __device__ unsigned long long g_blk[];
+    g_blk[3 * blockIdx.x] = t0; g_blk[3 * blockIdx.x + 1] = t1; g_blk[3 * blockIdx.x + 2] = smid;
+  }
+#endif
 }
+#ifdef BLKTIME
+__device__ unsigned long long g_blk[3 * 8192];
+#endif
 
 template <int K>
 void launch_pass(const double* in, double* out, int N, cudaStream_t st) {
@@ -268,8 +316,11 @@ void launch_pass(const double* in, double* out, int N, cudaStream_t st) {
   constexpr int W = B * C;
   static_assert(W > 2 * HL, "strip too narrow for K");
   const int Wout = W - 2 * HL;
-  const int nS = (N + Wout - 1) / Wout;
-  const size_t smem = sizeof(double) * (4 * K * (B + 2) + PF * B * C);
+  static_assert(2 * K + 1 <= 64, "boundary ring too small");
+  // aligned strips (first starts at col 0, last ends at col N-1) need N >= 2W
+  const int aligned = (N >= 2 * W);
+  const int nS = aligned ? 2 + (N - 2 * W + 2 * HL + Wout - 1) / Wout : (N + Wout - 1) / Wout;
+  const size_t smem = sizeof(double) * (4 * K * (B + 2) + PF * B * C + 128);
 
   static int resident = -1;  // blocks that fit on the whole GPU at once
   if (resident < 0) {
@@ -280,21 +331,11 @@ void launch_pass(const double* in, double* out, int N, cudaStream_t st) {
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, pass_kernel<K, C, B>, B, smem);
     resident = std::max(1, per) * nsm;
   }
-  // choose number of row chunks: minimise (#waves) * (rows per chunk + warm-up)
-  int bestP = 1;
-  double bestCost = 1e300;
-  for (int P = 1; P <= 256 && P <= N; ++P) {
-    int H = (N + P - 1) / P;
-    long blocks = (long)nS * P;
-    long waves = (blocks + resident - 1) / resident;
-    double cost = (double)waves * (H + 3 * K);
-    if (cost < bestCost * 0.999) { bestCost = cost; bestP = P; }
-  }
-  const int H = (N + bestP - 1) / bestP;
-  const int P = (N + H - 1) / H;
-  dim3 grid(nS, P);
+  const long long U = (long long)nS * N;
+  static int mult = getenv("KB_MULT") ? atoi(getenv("KB_MULT")) : 1;
+  const int nBlk = (int)std::min<long long>((long long)resident * mult, U);
   const int vec = (N % 2 == 0);
-  pass_kernel<K, C, B><<<grid, B, smem, st>>>(in, out, N, Wout, H, vec);
+  pass_kernel<K, C, B><<<nBlk, B, smem, st>>>(in, out, N, nS, vec, aligned);
 }
 
 void launch_k(int k, const double* in, double* out, int N, cudaStream_t st) {
@@ -314,6 +355,20 @@ void launch_k(int k, const double* in, double* out, int N, cudaStream_t st) {
 
 }  // namespace
 
+#ifdef BLKTIME
+void dump_blk(int n) {
+  static unsigned long long h[3 * 8192];
+  cudaMemcpyFromSymbol(h, g_blk, sizeof(unsigned long long) * 3 * n);
+  unsigned long long mn = ~0ull, mx = 0;
+  for (int i = 0; i < n; ++i) { mn = std::min(mn, h[3 * i]); mx = std::max(mx, h[3 * i + 1]); }
+  int cnt[256] = {0};
+  for (int i = 0; i < n; ++i) cnt[h[3 * i + 2] & 255]++;
+  printf("kernel span %.3f ms\n", (mx - mn) / 1e6);
+  for (int i = 0; i < n; ++i)
+    printf("blk %3d sm %3llu start %8.3f end %8.3f dur %8.3f\n", i, h[3 * i + 2], (h[3 * i] - mn) / 1e6,
+           (h[3 * i + 1] - mn) / 1e6, (h[3 * i + 1] - h[3 * i]) / 1e6);
+}
+#endif
 void sweep(const double* d_in, double* d_out, int N, int T) {
   static double* scratch = nullptr;
   static size_t scratchBytes = 0;
@@ -333,6 +388,9 @@ void sweep(const double* d_in, double* d_out, int N, int T) {
     const int k = (rem && p == 0) ? rem : KMAX;
     double* dst = ((nPass - 1 - p) % 2 == 0) ? d_out : scratch;
     launch_k(k, src, dst, N, 0);
+#ifdef BLKTIME
+    if (getenv("KB_DUMP") && p == nPass - 1) { cudaDeviceSynchronize(); dump_blk(atoi(getenv("KB_DUMP"))); }
+#endif
     src = dst;
   }
 }

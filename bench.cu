@@ -107,6 +107,14 @@ int main(int argc, char** argv) {
       }
     printf("small-grid checks: %d cases, %d failures -> %s\n", cnt, fails, fails ? "FAIL" : "PASS");
     allPass &= (fails == 0);
+    // medium grids: exercise the wide-strip / boundary-aligned code paths of the fast kernel
+    const int Nm[] = {511, 512, 513, 514, 700, 767, 768, 769, 1000, 1023, 1500, 1537, 2048, 2049, 3001};
+    const int Tm[] = {1, 2, 7, 8, 13, 24, 25};
+    cnt = 0; fails = 0;
+    for (int N_ : Nm)
+      for (int T_ : Tm) { bool p = check_case(N_, T_, false, false); ++cnt; if (!p) ++fails; }
+    printf("medium-grid checks: %d cases, %d failures -> %s\n", cnt, fails, fails ? "FAIL" : "PASS");
+    allPass &= (fails == 0);
   }
   if (fullCheck) {
     printf("full-workload check (N=%d, T=%d) vs GPU reference:\n", N, T);
