@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <type_traits>
 
 namespace {
 
@@ -38,14 +39,42 @@ constexpr double C2 = 0.03125;  // row i-1 (3 points) and (i, j-1)
 #define MINB 2
 #endif
 
+#ifndef PAIRSUM
+#define PAIRSUM 1
+#endif
+#ifndef PF
+#define PF 4
+#endif
+
+__device__ __forceinline__ void cp_async16(double* sdst, const double* gsrc) {
+  unsigned sa = (unsigned)__cvta_generic_to_shared(sdst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(gsrc));
+}
+__device__ __forceinline__ void cp_async16z(double* sdst, const double* gsrc, int srcBytes) {
+  unsigned sa = (unsigned)__cvta_generic_to_shared(sdst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa), "l"(gsrc), "r"(srcBytes));
+}
+__device__ __forceinline__ void cp_async8(double* sdst, const double* gsrc, int srcBytes) {
+  unsigned sa = (unsigned)__cvta_generic_to_shared(sdst);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(sa), "l"(gsrc), "r"(srcBytes));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N_> __device__ __forceinline__ void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N_));
+}
+
 template <int K> struct Geo {
   static constexpr int HL = K + (K & 1);  // even halo so that the strip start is 16B aligned
 };
 
 // ---------------------------------------------------------------------------------------
-// One pass: K time levels.  FAST = block does not touch the grid boundary / outside.
+// One pass: K time levels.
+//  COLFAST = the block's columns all lie inside [0, N-1] (true for all but the first/last
+//            strip).  Then no per-column boundary logic is needed.
+//  Inside the row loop, an iteration is "row-fast" if no level touches a boundary row
+//  (warp-uniform test); only the few iterations near rows 0 / N-1 use the general code.
 // ---------------------------------------------------------------------------------------
-template <int K, int C, int B, bool FAST>
+template <int K, int C, int B, bool COLFAST>
 __device__ __forceinline__ void pass_body(const double* __restrict__ in, double* __restrict__ out,
                                           int N, int Wout, int H, bool vec) {
   constexpr int HL = Geo<K>::HL;
@@ -63,6 +92,7 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
   const int r0 = blockIdx.y * H;           // first output row of this chunk
   const int rs = r0 - K;                   // first input row streamed
   const int rEnd = min(r0 + H, N);         // output rows [r0, rEnd)
+  const bool vecIO = COLFAST && (C % 2 == 0) && vec;
 
   // zero both buffers (incl. pads)
   for (int i = t; i < 4 * K * (B + 2); i += B) smem[i] = 0.0;
@@ -87,40 +117,47 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
 #pragma unroll
     for (int q = 0; q < C; ++q) { acc0[s][q] = 0.0; acc1[s][q] = 0.0; }
 
-  auto load_row = [&](int r, double (&v)[C]) {
-    if (FAST) {
-      const double* p = in + (size_t)r * N + jc;
-      if (C % 2 == 0 && vec) {
+  // input rows are prefetched PF rows ahead with cp.async into a per-thread smem ring
+  double* sIn = smem + 4 * K * (B + 2);  // [PF][B*C]
+  auto issue_row = [&](int r, int slot) {
+    double* dst = sIn + slot * (B * C) + t * C;
+    const bool rok = (r >= 0 && r < N);
+    if (vecIO) {
+#ifdef PROBE
+      const double* src = in + (size_t)(r & 15) * N + jc;  // compute-only probe: L2-resident rows
+#else
+      const double* src = rok ? in + (size_t)r * N + jc : in;
+#endif
 #pragma unroll
-        for (int q = 0; q < C; q += 2) {
-          double2 d = __ldg(reinterpret_cast<const double2*>(p + q));
-          v[q] = d.x; v[q + 1] = d.y;
-        }
-      } else {
-#pragma unroll
-        for (int q = 0; q < C; ++q) v[q] = __ldg(p + q);
-      }
+      for (int q = 0; q < C; q += 2) cp_async16z(dst + q, src + q, rok ? 16 : 0);
     } else {
-      bool rok = (r >= 0 && r < N);
 #pragma unroll
       for (int q = 0; q < C; ++q) {
-        int j = jc + q;
-        v[q] = (rok && j >= 0 && j < N) ? __ldg(in + (size_t)r * N + j) : 0.0;
+        const int j = jc + q;
+        const bool ok = rok && (COLFAST || (j >= 0 && j < N));
+        cp_async8(dst + q, ok ? in + (size_t)r * N + j : in, ok ? 8 : 0);
       }
     }
   };
 
-  double nxt[C];
-  load_row(rs, nxt);
+  const int nIt = 3 * K + H;
+#pragma unroll
+  for (int d = 0; d < PF; ++d) {
+    if (d < nIt) issue_row(rs + d, d);
+    cp_async_commit();
+  }
   __syncthreads();
 
-  const int nIt = 3 * K + H;
   int cur = 0;
-  for (int it = 0; it < nIt; ++it) {
+  int slot = 0;
+
+  // one row-iteration; GEN = general (boundary-aware) arithmetic
+  auto iteration = [&](int it, auto genTag) {
+    constexpr bool GEN = decltype(genTag)::value;
     double inrow[C];
+    cp_async_wait<PF - 1>();
 #pragma unroll
-    for (int q = 0; q < C; ++q) inrow[q] = nxt[q];
-    if (it + 1 < nIt) load_row(rs + it + 1, nxt);  // prefetch one row ahead
+    for (int q = 0; q < C; ++q) inrow[q] = sIn[slot * (B * C) + t * C + q];
 
     const int nb = cur ^ 1;
 #pragma unroll
@@ -131,19 +168,36 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
       const double xl = SR(cur, s - 1, t);      // left neighbour's last column
       const double xr = SL(cur, s - 1, t + 2);  // right neighbour's first column
       const int a = rs + it - 1 - 2 * (s - 1);  // row index of the arriving row x
+      const bool rIm1 = (a - 1 >= 1) && (a - 1 <= N - 2);
+      const bool rI0 = (a >= 1) && (a <= N - 2);
+      // row sums R[q] = x[q-1]+x[q]+x[q+1], via pair sums: 1.5 adds per column
+      double Rs[C];
+#pragma unroll
+      for (int q = 0; q < C; ++q) {
+        const double l = (q == 0) ? xl : x[q - 1];
+        const double r = (q == C - 1) ? xr : x[q + 1];
+        if (C % 2 == 0 && PAIRSUM) {
+          if (q % 2 == 0) {
+            const double p = x[q] + x[q + 1];
+            Rs[q] = l + p;
+            const double r1 = (q + 1 == C - 1) ? xr : x[q + 2];
+            Rs[q + 1] = p + r1;
+          }
+        } else {
+          Rs[q] = l + x[q] + r;
+        }
+      }
       double o[C];
 #pragma unroll
       for (int q = 0; q < C; ++q) {
         const double l = (q == 0) ? xl : x[q - 1];
         const double r = (q == C - 1) ? xr : x[q + 1];
-        const double R = l + x[q] + r;
-        double fin = fma(C1, R, acc0[s][q]);                          // row a-1 done
+        const double R = Rs[q];
+        double fin = fma(C1, R, acc0[s][q]);                            // row a-1 done
         double na = fma(C2, l, fma(C1, r, fma(C0, x[q], acc1[s][q])));  // row a partial
-        if (!FAST) {
-          const bool Im1 = colI[q] && (a - 1 >= 1) && (a - 1 <= N - 2);
-          const bool I0 = colI[q] && (a >= 1) && (a <= N - 2);
-          fin = Im1 ? fin : acc0[s][q];
-          na = I0 ? na : x[q];
+        if (GEN) {  // boundary points keep their value exactly
+          fin = (colI[q] && rIm1) ? fin : acc0[s][q];
+          na = (colI[q] && rI0) ? na : x[q];
         }
         o[q] = fin;
         acc0[s][q] = na;
@@ -156,9 +210,13 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
         SR(nb, s, t + 1) = o[C - 1];
       } else {
         const int ro = a - 1;
+#ifdef PROBE
+        if (ro >= r0 && ro < rEnd && o[0] == 1234.5) {
+#else
         if (ro >= r0 && ro < rEnd) {
+#endif
           double* p = out + (size_t)ro * N + jc;
-          if (FAST && C % 2 == 0 && vec) {
+          if (vecIO) {
             if (colOut[0]) {
 #pragma unroll
               for (int q = 0; q < C; q += 2)
@@ -177,8 +235,20 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
     for (int q = 0; q < C; ++q) pend[0][q] = inrow[q];
     SL(nb, 0, t + 1) = inrow[0];
     SR(nb, 0, t + 1) = inrow[C - 1];
+    if (it + PF < nIt) issue_row(rs + it + PF, slot);
+    cp_async_commit();
+    slot = (slot + 1 == PF) ? 0 : slot + 1;
+#ifndef NOSYNC
     __syncthreads();
+#endif
     cur = nb;
+  };
+
+  for (int it = 0; it < nIt; ++it) {
+    // arriving rows of all levels this iteration: [rs+it-1-2(K-1), rs+it-1]
+    const bool rowFast = (rs + it - 1 - 2 * (K - 1) >= 2) && (rs + it - 1 <= N - 2);
+    if (COLFAST && rowFast) iteration(it, std::integral_constant<bool, false>{});
+    else                    iteration(it, std::integral_constant<bool, true>{});
   }
 }
 
@@ -187,12 +257,9 @@ __global__ void __launch_bounds__(B, MINB)
 pass_kernel(const double* __restrict__ in, double* __restrict__ out, int N, int Wout, int H, int vec) {
   constexpr int HL = Geo<K>::HL;
   const int jt = blockIdx.x * Wout - HL;
-  const int r0 = blockIdx.y * H;
-  const int rs = r0 - K;
-  const int rLast = r0 + H + 2 * K - 1;  // last input row streamed
-  const bool fast = (jt >= 0) && (jt + B * C <= N) && (rs >= 0) && (rLast <= N - 1);
-  if (fast) pass_body<K, C, B, true>(in, out, N, Wout, H, vec != 0);
-  else      pass_body<K, C, B, false>(in, out, N, Wout, H, vec != 0);
+  const bool colFast = (jt >= 0) && (jt + B * C <= N);
+  if (colFast) pass_body<K, C, B, true>(in, out, N, Wout, H, vec != 0);
+  else         pass_body<K, C, B, false>(in, out, N, Wout, H, vec != 0);
 }
 
 template <int K>
@@ -202,7 +269,7 @@ void launch_pass(const double* in, double* out, int N, cudaStream_t st) {
   static_assert(W > 2 * HL, "strip too narrow for K");
   const int Wout = W - 2 * HL;
   const int nS = (N + Wout - 1) / Wout;
-  const size_t smem = sizeof(double) * 4 * K * (B + 2);
+  const size_t smem = sizeof(double) * (4 * K * (B + 2) + PF * B * C);
 
   static int resident = -1;  // blocks that fit on the whole GPU at once
   if (resident < 0) {
