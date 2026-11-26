@@ -112,3 +112,37 @@ versions with each other. Full = A100 80GB, N=16384, T=1000, median of 7.
 * A first dynamic-scheduling version that checked the claim every row: about 10% slower per block
   (thread-0 atomic before the barrier, plus an LDS after it). The fix was to check once per 16
   rows.
+
+## What limits the final version
+
+On the MIG slice (14 SMs, 1.41 GHz), the final kernel reaches 74.0 GCell/s of useful updates.
+Including the 3% column-halo/strip overhead and ~1% row warm-up, that is ~77 GCell/s computed.
+At 6.5 fp64 instructions per cell this is 77e9 × 6.5 / (14 × 1.41e9) ≈ 25.4 of the 32
+DFMA/clk/SM peak, about 79%.
+* A compute-only probe (loads from L2-resident rows, no stores) runs within ~4% of the real
+  kernel, so the kernel is fp64-issue/latency bound, not HBM bound. On the full A100 (more
+  bandwidth per SM than the 1/8-memory MIG slice) this should hold even more.
+* A no-barrier probe is ~6% faster than the compute-only probe, which bounds what any barrier
+  scheme could gain. Both alternatives tried (mbarrier split, neighbour flags) lost more than
+  that.
+* What remains is dependency/latency stalls in a 12-warp, register-capped (168 regs/thread)
+  configuration. More warps, deeper unrolling or larger K all exceed the register file
+  (64K regs/SM), and every such variant measured slower.
+
+## Final measurement and stop condition
+
+Final MIG run of `./bench --n 8192 --t 1000` (the full 16384² workload does not fit with the
+reference on the 5 GB slice):
+
+```
+device: NVIDIA A100-SXM4-40GB MIG 1g.5gb, 14 SMs, 5.1 GB
+small-grid checks: 462 cases, 0 failures -> PASS
+medium-grid checks: 105 cases, 0 failures -> PASS
+full-workload check (N=8192, T=1000) vs GPU reference:
+  N= 8192 T=1000 maxerr=2.331e-15 boundary=exact d_in=unchanged finite=yes -> PASS
+timing N=8192 T=1000 runs(ms): 906.73 906.74 906.76 906.75 906.72 906.70 906.75
+median 906.742 ms  ->  74.0 GCell/s
+OVERALL: PASS
+```
+
+FULL_A100_SECTION
