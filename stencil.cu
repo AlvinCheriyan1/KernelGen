@@ -52,7 +52,7 @@ constexpr double C2 = 0.03125;  // row i-1 (3 points) and (i, j-1)
 #define PAIRSUM 1
 #endif
 #ifndef PF
-#define PF 4
+#define PF 8
 #endif
 
 __device__ __forceinline__ void cp_async16(double* sdst, const double* gsrc) {
