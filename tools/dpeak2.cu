@@ -26,9 +26,9 @@ __global__ void k(double* out, int iters, double a, double b) {
   for (int i = 0; i < ILP; ++i) s += x[i] + y[i] + z[i];
   if (s == 1234.5) out[0] = s;
 }
-template <int MODE> void run(int nsm, double* d, int opsPerIter, const char* name) {
+template <int MODE> void run(int nsm, double* d, int opsPerIter, const char* name, int thr = 256, int bps = 4) {
   cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-  int thr = 256, blocks = nsm * 4, iters = 20000;
+  int blocks = nsm * bps, iters = 20000;
   k<MODE><<<blocks, thr>>>(d, iters, 0.999, 1e-3);
   cudaEventRecord(e0); k<MODE><<<blocks, thr>>>(d, iters, 0.999, 1e-3); cudaEventRecord(e1); cudaEventSynchronize(e1);
   float ms; cudaEventElapsedTime(&ms, e0, e1);
@@ -42,5 +42,10 @@ int main() {
   run<1>(nsm, d, 1, "fma 2 reg src");
   run<2>(nsm, d, 2, "dadd 2 reg src");
   run<3>(nsm, d, 1, "fma 3 reg src");
-  run<4>(nsm, d, 10, "stencil-like mix");
+  run<4>(nsm, d, 10, "stencil-like mix 32w");
+  run<4>(nsm, d, 10, "stencil-like mix 12w", 384, 1);
+  run<4>(nsm, d, 10, "stencil-like mix 8w", 256, 1);
+  run<4>(nsm, d, 10, "stencil-like mix 4w", 128, 1);
+  run<1>(nsm, d, 1, "fma2 12w", 384, 1);
+  run<1>(nsm, d, 1, "fma2 4w", 128, 1);
 }

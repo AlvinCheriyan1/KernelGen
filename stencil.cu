@@ -39,6 +39,15 @@ constexpr double C2 = 0.03125;  // row i-1 (3 points) and (i, j-1)
 #define MINB 2
 #endif
 
+#ifndef HC
+#define HC 32       // rows claimed per dynamic chunk
+#endif
+#ifndef MINSTEAL
+#define MINSTEAL 32 // minimum rows worth stealing
+#endif
+#ifndef UNROLL2
+#define UNROLL2 0
+#endif
 #ifndef PAIRSUM
 #define PAIRSUM 1
 #endif
@@ -74,10 +83,15 @@ template <int K> struct Geo {
 //  Inside the row loop, an iteration is "row-fast" if no level touches a boundary row
 //  (warp-uniform test); only the few iterations near rows 0 / N-1 use the general code.
 // ---------------------------------------------------------------------------------------
+// Dynamic extension: if ctlOwn != nullptr the segment belongs to the block's own piece and
+// thread 0 keeps claiming further chunks of HC rows (contiguous, same strip) from the
+// piece's front while streaming, so the pipeline never restarts.  Returns the end row
+// (exclusive) of what was processed.
 template <int K, int C, int B>
-__device__ __forceinline__ void pass_body(const double* __restrict__ in, double* __restrict__ out,
-                                          int N, int nS, int strip, int r0, int H, bool vec,
-                                          bool aligned) {
+__device__ __forceinline__ int pass_body(const double* __restrict__ in, double* __restrict__ out,
+                                         int N, int nS, int strip, int r0, int H, bool vec,
+                                         bool aligned, unsigned long long* ctlOwn,
+                                         long long pieceBeg, long long frontAbs) {
   constexpr int HL = Geo<K>::HL;
   extern __shared__ double smem[];
   // edge buffers: sL[buf][lvl][B+2] (first value of each thread), sR likewise (last value)
@@ -105,8 +119,8 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
   const bool hasR = aligned && jt + W == N && threadIdx.x == B - 1;
   const int jc = jt + t * C;               // first column of this thread
   const int rs = r0 - K;                   // first input row streamed
-  const int rEnd = min(r0 + H, N);         // output rows [r0, rEnd)
   __syncthreads();  // previous segment of this block is completely done with smem
+  __shared__ int sHi[2];
   // per-thread: are all my columns inside the grid?  (vector loads/stores)
   const bool vecIO = (C % 2 == 0) && vec && (jc >= 0) && (jc + C <= N);
   // per-warp: are all the warp's columns interior (1..N-2)?  Then no column-boundary logic.
@@ -160,20 +174,30 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
     }
   };
 
-  const int nIt = 3 * K + H;
 #pragma unroll
   for (int d = 0; d < PF; ++d) {
-    if (d < nIt) issue_row(rs + d, d);
+    issue_row(rs + d, d);
     cp_async_commit();
   }
+  int hi = r0 + H;  // claimed output rows: [r0, hi)   (block-uniform)
+  // thread 0 only: claiming state
+  bool claimable = (ctlOwn != nullptr);
+  bool inFlight = false;
+  unsigned long long tok = 0;
+  int reqRows = 0;
+  long long nextFront = frontAbs + H;  // absolute unit index of the next row to claim
+  int hiT0 = hi;                        // thread 0's (newest) view of the claimed end
   __syncthreads();
 
-  int cur = 0;
   int slot = 0;
+  // warp-uniform: does this warp hold boundary column 0 or N-1 (aligned strips)?
+  const bool warpBnd = __any_sync(0xffffffffu, hasL || hasR);
 
-  // one row-iteration; GEN = general (boundary-aware) arithmetic
-  auto iteration = [&](int it, auto genTag) {
+  // one row-iteration.  GEN = general (boundary-aware) arithmetic; BND = apply the
+  // boundary-column restore; CUR = which half of the edge double buffer is read.
+  auto iteration = [&](int it, auto genTag, auto bndTag, int cur) {
     constexpr bool GEN = decltype(genTag)::value;
+    constexpr bool BND = decltype(bndTag)::value;
     double inrow[C];
     cp_async_wait<PF - 1>();
 #pragma unroll
@@ -223,8 +247,10 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
         acc0[s][q] = na;
         acc1[s][q] = C2 * R;
       }
-      if (hasL) o[0] = sBnd[(a - 1) & 63];
-      if (hasR) o[C - 1] = sBnd[64 + ((a - 1) & 63)];
+      if (BND) {
+        if (hasL) o[0] = sBnd[(a - 1) & 63];
+        if (hasR) o[C - 1] = sBnd[64 + ((a - 1) & 63)];
+      }
       if (s < K) {
 #pragma unroll
         for (int q = 0; q < C; ++q) pend[s][q] = o[q];
@@ -233,9 +259,9 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
       } else {
         const int ro = a - 1;
 #ifdef PROBE
-        if (ro >= r0 && ro < rEnd && o[0] == 1234.5) {
+        if (ro >= r0 && ro < hi && o[0] == 1234.5) {
 #else
-        if (ro >= r0 && ro < rEnd) {
+        if (ro >= r0 && ro < hi) {
 #endif
           double* p = out + (size_t)ro * N + jc;
           if (vecIO) {
@@ -257,45 +283,148 @@ __device__ __forceinline__ void pass_body(const double* __restrict__ in, double*
     for (int q = 0; q < C; ++q) pend[0][q] = inrow[q];
     SL(nb, 0, t + 1) = inrow[0];
     SR(nb, 0, t + 1) = inrow[C - 1];
-    if (hasL) sBnd[(rs + it) & 63] = inrow[0];
-    if (hasR) sBnd[64 + ((rs + it) & 63)] = inrow[C - 1];
-    if (it + PF < nIt) issue_row(rs + it + PF, slot);
+    if (BND) {
+      if (hasL) sBnd[(rs + it) & 63] = inrow[0];
+      if (hasR) sBnd[64 + ((rs + it) & 63)] = inrow[C - 1];
+    }
+    issue_row(rs + it + PF, slot);
     cp_async_commit();
     slot = (slot + 1 == PF) ? 0 : slot + 1;
 #ifndef NOSYNC
     __syncthreads();
 #endif
-    cur = nb;
   };
 
-  for (int it = 0; it < nIt; ++it) {
+  using T_ = std::integral_constant<bool, true>;
+  using F_ = std::integral_constant<bool, false>;
+  auto step = [&](int it, int curTag) {
     // arriving rows of all levels this iteration: [rs+it-1-2(K-1), rs+it-1]
     const bool rowFast = (rs + it - 1 - 2 * (K - 1) >= 2) && (rs + it - 1 <= N - 2);
-    if (warpColFast && rowFast) iteration(it, std::integral_constant<bool, false>{});
-    else                    iteration(it, std::integral_constant<bool, true>{});
+    if (warpColFast && rowFast) {
+      if (warpBnd) iteration(it, F_{}, T_{}, curTag);
+      else         iteration(it, F_{}, F_{}, curTag);
+    } else {
+      iteration(it, T_{}, T_{}, curTag);
+    }
+  };
+  // Rows are processed in chunks of <= CH iterations whose count is known up front, so the
+  // claim bookkeeping (thread 0) and the broadcast of the claimed end only happen once per
+  // chunk.  A claim's atomic is consumed one chunk after it was issued (latency hidden).
+  constexpr int CH = 16;
+  __shared__ int sFl[2];
+  bool flV = false;  // block-visible: a claim is in flight
+  int par = 0;
+  int it = 0;
+  auto consume = [&]() {
+    inFlight = false;
+    const long long f = pieceBeg + (long long)(tok >> 32);
+    const long long e = pieceBeg + (long long)(tok & 0xffffffffull);
+    const int got = (f < e) ? (int)(min(f + reqRows, e) - f) : 0;
+    hiT0 += got;
+    nextFront += got;
+    if (got < reqRows) claimable = false;  // piece exhausted (or stolen up to here)
+  };
+  while (true) {
+    const int roK = rs + it - 2 * K;  // row finished by the top level in iteration `it`
+    if (roK >= hi) {
+      if (!flV) break;
+      // rare: claimed rows ran out while a claim is still in flight -> wait for it
+      if (t == 0) { consume(); sHi[par] = hiT0; sFl[par] = 0; }
+      __syncthreads();
+      hi = sHi[par]; flV = false;
+      __syncthreads();
+      continue;
+    }
+    const int n = min(CH, hi - roK);
+    if (ctlOwn != nullptr && t == 0) {
+      if (inFlight) consume();
+      if (claimable && !inFlight && hiT0 - roK <= 3 * CH) {
+        const long long stripEnd = (long long)(strip + 1) * N;
+        reqRows = (int)min((long long)HC, stripEnd - nextFront);
+        if (reqRows <= 0) {
+          claimable = false;
+        } else {
+          tok = atomicAdd(ctlOwn, (unsigned long long)reqRows << 32);
+          inFlight = true;
+        }
+      }
+      sHi[par] = hiT0;
+      sFl[par] = inFlight ? 1 : 0;
+    }
+    for (int j = 0; j < n; ++j, ++it) step(it, it & 1);  // each step ends with __syncthreads
+    if (ctlOwn != nullptr) { hi = sHi[par]; flV = sFl[par] != 0; par ^= 1; }
   }
   cp_async_wait<0>();
+  return hi;
 }
 
 // Work decomposition: the nS strips x N rows are laid out as one long list of row-units
 // (strip-major) and cut into gridDim.x equal pieces, one per block, with gridDim.x = number
-// of blocks that are co-resident on the GPU.  So every SM slot gets the same amount of work
-// (no wave quantisation).  A piece may span two strips -> processed as two segments.
+// of blocks that are co-resident on the GPU.  Each block streams through its own piece,
+// claiming HC rows at a time from the piece's front (ctl word = front<<32 | back).
+// A block that runs out of work steals the back half of the largest remaining piece, so
+// slower blocks (scheduling, boundary strips) no longer determine the kernel time.
 template <int K, int C, int B>
 __global__ void __launch_bounds__(B, MINB)
-pass_kernel(const double* __restrict__ in, double* __restrict__ out, int N, int nS, int vec, int aligned) {
+pass_kernel(const double* __restrict__ in, double* __restrict__ out, int N, int nS, int vec,
+            int aligned, unsigned long long* __restrict__ ctl) {
 #ifdef BLKTIME
   unsigned long long t0; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
 #endif
+  __shared__ long long sSeg[2];
   const long long U = (long long)nS * N;
-  long long beg = U * blockIdx.x / gridDim.x;
-  const long long end = U * (blockIdx.x + 1) / gridDim.x;
-  while (beg < end) {
-    const int strip = (int)(beg / N);
-    const int r0 = (int)(beg - (long long)strip * N);
-    const int H = (int)(min(end, (long long)(strip + 1) * N) - beg);
-    pass_body<K, C, B>(in, out, N, nS, strip, r0, H, vec != 0, aligned != 0);
-    beg += H;
+  const int nb = gridDim.x;
+  auto pieceBeg = [&](int b) { return U * b / nb; };
+  const long long pb = pieceBeg(blockIdx.x);
+  long long front = pb;
+  // ---- owner phase
+  while (true) {
+    if (threadIdx.x == 0) {
+      const long long stripEnd = (front / N + 1) * N;
+      const int req = (int)min((long long)HC, stripEnd - front);
+      const unsigned long long old = atomicAdd(&ctl[blockIdx.x], (unsigned long long)req << 32);
+      const long long f = pb + (long long)(old >> 32), e = pb + (long long)(old & 0xffffffffull);
+      sSeg[0] = (f < e) ? min(f + req, e) - f : 0;
+    }
+    __syncthreads();
+    const int got = (int)sSeg[0];
+    __syncthreads();
+    if (got == 0) break;
+    const int strip = (int)(front / N);
+    const int r0 = (int)(front - (long long)strip * N);
+    const int hi = pass_body<K, C, B>(in, out, N, nS, strip, r0, got, vec != 0, aligned != 0,
+                                      &ctl[blockIdx.x], pb, front);
+    front = (long long)strip * N + hi;
+  }
+  // ---- steal phase
+  while (true) {
+    if (threadIdx.x == 0) {
+      long long sb = -1, se = -1;
+      for (int tries = 0; tries < 4 && sb < 0; ++tries) {
+        int best = -1; long long bestRem = 0; unsigned long long bestOld = 0;
+        for (int v = 0; v < nb; ++v) {
+          const unsigned long long w = *(volatile unsigned long long*)&ctl[v];
+          const long long rem = (long long)(w & 0xffffffffull) - (long long)(w >> 32);
+          if (rem > bestRem) { bestRem = rem; best = v; bestOld = w; }
+        }
+        if (best < 0 || bestRem < 2 * MINSTEAL) break;
+        const long long f = (long long)(bestOld >> 32), e = (long long)(bestOld & 0xffffffffull);
+        long long ne = e - bestRem / 2;
+        const long long pbv = pieceBeg(best);
+        const long long stripStart = ((pbv + e - 1) / N) * N;  // stay inside one strip
+        if (pbv + ne < stripStart) ne = stripStart - pbv;
+        const unsigned long long nw = ((unsigned long long)f << 32) | (unsigned long long)ne;
+        if (atomicCAS(&ctl[best], bestOld, nw) == bestOld) { sb = pbv + ne; se = pbv + e; }
+      }
+      sSeg[0] = sb; sSeg[1] = se;
+    }
+    __syncthreads();
+    const long long sb = sSeg[0], se = sSeg[1];
+    __syncthreads();
+    if (sb < 0) break;
+    const int strip = (int)(sb / N);
+    const int r0 = (int)(sb - (long long)strip * N);
+    pass_body<K, C, B>(in, out, N, nS, strip, r0, (int)(se - sb), vec != 0, aligned != 0, nullptr, 0, sb);
   }
 #ifdef BLKTIME
   if (threadIdx.x == 0) {
@@ -306,6 +435,12 @@ pass_kernel(const double* __restrict__ in, double* __restrict__ out, int N, int 
   }
 #endif
 }
+
+__global__ void init_ctl(unsigned long long* ctl, long long U, int nb) {
+  for (int b = blockIdx.x * blockDim.x + threadIdx.x; b < nb; b += gridDim.x * blockDim.x)
+    ctl[b] = (unsigned long long)(U * (b + 1) / nb - U * b / nb);  // front = 0, back = length
+}
+
 #ifdef BLKTIME
 __device__ unsigned long long g_blk[3 * 8192];
 #endif
@@ -335,7 +470,15 @@ void launch_pass(const double* in, double* out, int N, cudaStream_t st) {
   static int mult = getenv("KB_MULT") ? atoi(getenv("KB_MULT")) : 1;
   const int nBlk = (int)std::min<long long>((long long)resident * mult, U);
   const int vec = (N % 2 == 0);
-  pass_kernel<K, C, B><<<nBlk, B, smem, st>>>(in, out, N, nS, vec, aligned);
+  static unsigned long long* ctl = nullptr;
+  static int ctlCap = 0;
+  if (ctlCap < nBlk) {
+    if (ctl) cudaFree(ctl);
+    cudaMalloc(&ctl, sizeof(unsigned long long) * nBlk);
+    ctlCap = nBlk;
+  }
+  init_ctl<<<(nBlk + 127) / 128, 128, 0, st>>>(ctl, U, nBlk);
+  pass_kernel<K, C, B><<<nBlk, B, smem, st>>>(in, out, N, nS, vec, aligned, ctl);
 }
 
 void launch_k(int k, const double* in, double* out, int N, cudaStream_t st) {
