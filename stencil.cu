@@ -27,16 +27,16 @@ constexpr double C1 = 0.09375;  // row i+1 (3 points) and (i, j+1)
 constexpr double C2 = 0.03125;  // row i-1 (3 points) and (i, j-1)
 
 #ifndef KMAX
-#define KMAX 12
+#define KMAX 8
 #endif
 #ifndef BX
-#define BX 128
+#define BX 384
 #endif
 #ifndef CX
 #define CX 2
 #endif
 #ifndef MINB
-#define MINB 2
+#define MINB 1
 #endif
 
 #ifndef HC
