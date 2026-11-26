@@ -94,7 +94,9 @@ versions with each other. Full = A100 80GB, N=16384, T=1000, median of 7.
 * Static equal split with one block per slot, at 2–3 blocks/SM: the warp scheduler favours the
   oldest block, so co-resident blocks run at different speeds (4.9 vs 6.0 vs 7.9 ms for equal
   work), leaving SMs under-occupied at the end. Fixed by 1 block/SM plus dynamic balancing.
-* Unrolling the row loop by 2 (static double-buffer index): +10 registers → spills at 168 regs.
+* Unrolling the row loop by 2 (static double-buffer index): spills at the 168-register cap with
+  384 threads (66.6 vs 74.0). With 256 threads it does not spill (214 regs), but 8 warps/SM are
+  too few: 59.5 (and 64.1 without the unroll). Left behind `UNROLL2` (off).
 * 4 columns per thread (C=4, 256 threads): 255 registers/spills at K=8; 58–60 vs 70 GCell/s.
 * Split arrive/wait barrier (mbarrier) with the register-only part of each level computed
   between arrive and wait: correct, but it pushed the kernel over the 168-register cap (spills),

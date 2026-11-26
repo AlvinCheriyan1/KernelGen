@@ -100,6 +100,9 @@ __device__ __forceinline__ void mbar_wait(unsigned long long* bar, unsigned long
   } while (!done);
 }
 
+__device__ __forceinline__ int cur_of(int v) { return v; }
+template <int V> __device__ __forceinline__ int cur_of(std::integral_constant<int, V>) { return V; }
+
 template <int K> struct Geo {
   static constexpr int HL = K + (K & 1);  // even halo so that the strip start is 16B aligned
 };
@@ -251,7 +254,8 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
 
   // one row-iteration.  GEN = general (boundary-aware) arithmetic; BND = apply the
   // boundary-column restore; CUR = which half of the edge double buffer is read.
-  auto iteration = [&](int it, auto genTag, auto bndTag, int cur) {
+  auto iteration = [&](int it, auto genTag, auto bndTag, auto curv) {
+    const int cur = cur_of(curv);  // compile-time constant when an integral_constant is passed
     constexpr bool GEN = decltype(genTag)::value;
     constexpr bool BND = decltype(bndTag)::value;
     double inrow[C];
@@ -405,7 +409,7 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
 
   using T_ = std::integral_constant<bool, true>;
   using F_ = std::integral_constant<bool, false>;
-  auto step = [&](int it, int curTag) {
+  auto step = [&](int it, auto curTag) {
     // arriving rows of all levels this iteration: [rs+it-1-2(K-1), rs+it-1]
     const bool rowFast = (rs + it - 1 - 2 * (K - 1) >= 2) && (rs + it - 1 <= N - 2);
     if (warpColFast && rowFast) {
@@ -462,7 +466,18 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
 #ifdef NOSYNC
     __syncthreads();  // probe only: keep the chunk-level barrier for the claim broadcast
 #endif
+#if UNROLL2
+    // pairs of iterations with a static double-buffer index
+    using I0 = std::integral_constant<int, 0>;
+    using I1 = std::integral_constant<int, 1>;
+    for (int j = 0; j < n;) {
+      if (it & 1) { step(it, I1{}); ++it; ++j; }
+      else if (j + 1 < n) { step(it, I0{}); step(it + 1, I1{}); it += 2; j += 2; }
+      else { step(it, I0{}); ++it; ++j; }
+    }
+#else
     for (int j = 0; j < n; ++j, ++it) step(it, it & 1);  // each step ends with __syncthreads
+#endif
     if (ctlOwn != nullptr) {
       if (SPLITBAR) { bar_wait(); bar_arrive(); }  // make thread 0's sHi write visible
       if (NBSYNC) __syncthreads();
