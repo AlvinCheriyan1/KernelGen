@@ -45,6 +45,9 @@ constexpr double C2 = 0.03125;  // row i-1 (3 points) and (i, j-1)
 #ifndef MINSTEAL
 #define MINSTEAL 32 // minimum rows worth stealing
 #endif
+#ifndef SPLITBAR
+#define SPLITBAR 0
+#endif
 #ifndef UNROLL2
 #define UNROLL2 0
 #endif
@@ -70,6 +73,25 @@ __device__ __forceinline__ void cp_async8(double* sdst, const double* gsrc, int 
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N_> __device__ __forceinline__ void cp_async_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N_));
+}
+
+__device__ __forceinline__ void mbar_init(unsigned long long* bar, int count) {
+  unsigned a = (unsigned)__cvta_generic_to_shared(bar);
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" ::"r"(a), "r"(count) : "memory");
+}
+__device__ __forceinline__ unsigned long long mbar_arrive(unsigned long long* bar) {
+  unsigned a = (unsigned)__cvta_generic_to_shared(bar);
+  unsigned long long st;
+  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];\n" : "=l"(st) : "r"(a) : "memory");
+  return st;
+}
+__device__ __forceinline__ void mbar_wait(unsigned long long* bar, unsigned long long st) {
+  unsigned a = (unsigned)__cvta_generic_to_shared(bar);
+  unsigned done;
+  do {
+    asm volatile("{\n .reg .pred p;\n mbarrier.test_wait.shared.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}\n"
+                 : "=r"(done) : "r"(a), "l"(st) : "memory");
+  } while (!done);
 }
 
 template <int K> struct Geo {
@@ -190,6 +212,16 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
   __syncthreads();
 
   int slot = 0;
+  // split arrive/wait barrier (mbarrier) replacing the per-row __syncthreads
+  __shared__ unsigned long long sBar;
+  if (SPLITBAR) {
+    if (t == 0) mbar_init(&sBar, B);
+    __syncthreads();
+  }
+  unsigned long long barTok = 0;
+  auto bar_arrive = [&]() { barTok = mbar_arrive(&sBar); };
+  auto bar_wait = [&]() { mbar_wait(&sBar, barTok); };
+  if (SPLITBAR) bar_arrive();
   // warp-uniform: does this warp hold boundary column 0 or N-1 (aligned strips)?
   const bool warpBnd = __any_sync(0xffffffffu, hasL || hasR);
 
@@ -204,6 +236,71 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
     for (int q = 0; q < C; ++q) inrow[q] = sIn[slot * (B * C) + t * C + q];
 
     const int nb = cur ^ 1;
+
+    // writes level s's finished row (o) to the next level / smem edges / global output
+    auto emit = [&](int s, int a, double (&o)[C]) {
+      if (BND) {
+        if (hasL) o[0] = sBnd[(a - 1) & 63];
+        if (hasR) o[C - 1] = sBnd[64 + ((a - 1) & 63)];
+      }
+      if (s < K) {
+#pragma unroll
+        for (int q = 0; q < C; ++q) pend[s][q] = o[q];
+        SL(nb, s, t + 1) = o[0];
+        SR(nb, s, t + 1) = o[C - 1];
+      } else {
+        const int ro = a - 1;
+#ifdef PROBE
+        if (ro >= r0 && ro < hi && o[0] == 1234.5) {
+#else
+        if (ro >= r0 && ro < hi) {
+#endif
+          double* p = out + (size_t)ro * N + jc;
+          if (vecIO) {
+            if (colOut[0]) {
+#pragma unroll
+              for (int q = 0; q < C; q += 2)
+                *reinterpret_cast<double2*>(p + q) = make_double2(o[q], o[q + 1]);
+            }
+          } else {
+#pragma unroll
+            for (int q = 0; q < C; ++q)
+              if (colOut[q]) p[q] = o[q];
+          }
+        }
+      }
+    };
+
+    if constexpr (SPLITBAR && !GEN && C == 2) {
+      // Phase 1 (before waiting for the neighbours' edges): everything that only needs this
+      // thread's own columns.  These partials replace x and acc1 -> no extra registers.
+      double P[K + 1], T0[K + 1], T1[K + 1];
+#pragma unroll
+      for (int s = K; s >= 1; --s) {
+        const double x0 = pend[s - 1][0], x1 = pend[s - 1][1];
+        P[s] = x0 + x1;
+        T0[s] = fma(C1, x1, fma(C0, x0, acc1[s][0]));
+        T1[s] = fma(C2, x0, fma(C0, x1, acc1[s][1]));
+      }
+      bar_wait();
+      // Phase 2: needs the left/right neighbour values from shared memory
+#pragma unroll
+      for (int s = K; s >= 1; --s) {
+        const double xl = SR(cur, s - 1, t);
+        const double xr = SL(cur, s - 1, t + 2);
+        const int a = rs + it - 1 - 2 * (s - 1);
+        const double R0 = xl + P[s], R1 = P[s] + xr;
+        double o[C];
+        o[0] = fma(C1, R0, acc0[s][0]);
+        o[1] = fma(C1, R1, acc0[s][1]);
+        acc0[s][0] = fma(C2, xl, T0[s]);
+        acc0[s][1] = fma(C1, xr, T1[s]);
+        acc1[s][0] = C2 * R0;
+        acc1[s][1] = C2 * R1;
+        emit(s, a, o);
+      }
+    } else {
+    if (SPLITBAR) bar_wait();
 #pragma unroll
     for (int s = K; s >= 1; --s) {
       double x[C];
@@ -247,36 +344,8 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
         acc0[s][q] = na;
         acc1[s][q] = C2 * R;
       }
-      if (BND) {
-        if (hasL) o[0] = sBnd[(a - 1) & 63];
-        if (hasR) o[C - 1] = sBnd[64 + ((a - 1) & 63)];
-      }
-      if (s < K) {
-#pragma unroll
-        for (int q = 0; q < C; ++q) pend[s][q] = o[q];
-        SL(nb, s, t + 1) = o[0];
-        SR(nb, s, t + 1) = o[C - 1];
-      } else {
-        const int ro = a - 1;
-#ifdef PROBE
-        if (ro >= r0 && ro < hi && o[0] == 1234.5) {
-#else
-        if (ro >= r0 && ro < hi) {
-#endif
-          double* p = out + (size_t)ro * N + jc;
-          if (vecIO) {
-            if (colOut[0]) {
-#pragma unroll
-              for (int q = 0; q < C; q += 2)
-                *reinterpret_cast<double2*>(p + q) = make_double2(o[q], o[q + 1]);
-            }
-          } else {
-#pragma unroll
-            for (int q = 0; q < C; ++q)
-              if (colOut[q]) p[q] = o[q];
-          }
-        }
-      }
+      emit(s, a, o);
+    }
     }
     // level 0: the freshly loaded input row
 #pragma unroll
@@ -291,7 +360,8 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
     cp_async_commit();
     slot = (slot + 1 == PF) ? 0 : slot + 1;
 #ifndef NOSYNC
-    __syncthreads();
+    if (SPLITBAR) bar_arrive();
+    else __syncthreads();
 #endif
   };
 
@@ -351,9 +421,16 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
       sHi[par] = hiT0;
       sFl[par] = inFlight ? 1 : 0;
     }
+#ifdef NOSYNC
+    __syncthreads();  // probe only: keep the chunk-level barrier for the claim broadcast
+#endif
     for (int j = 0; j < n; ++j, ++it) step(it, it & 1);  // each step ends with __syncthreads
-    if (ctlOwn != nullptr) { hi = sHi[par]; flV = sFl[par] != 0; par ^= 1; }
+    if (ctlOwn != nullptr) {
+      if (SPLITBAR) { bar_wait(); bar_arrive(); }  // make thread 0's sHi write visible
+      hi = sHi[par]; flV = sFl[par] != 0; par ^= 1;
+    }
   }
+  if (SPLITBAR) bar_wait();
   cp_async_wait<0>();
   return hi;
 }
