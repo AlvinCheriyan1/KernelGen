@@ -566,7 +566,10 @@ void launch_pass(const double* in, double* out, int N, cudaStream_t st) {
   static int ctlCap = 0;
   if (ctlCap < nBlk) {
     if (ctl) cudaFree(ctl);
-    cudaMalloc(&ctl, sizeof(unsigned long long) * nBlk);
+    if (cudaMalloc(&ctl, sizeof(unsigned long long) * nBlk) != cudaSuccess) {
+      fprintf(stderr, "sweep: cannot allocate work-queue words\n");
+      abort();
+    }
     ctlCap = nBlk;
   }
   init_ctl<<<(nBlk + 127) / 128, 128, 0, st>>>(ctl, U, nBlk);
@@ -614,7 +617,10 @@ void sweep(const double* d_in, double* d_out, int N, int T) {
   const int nPass = full + (rem ? 1 : 0);
   if (nPass > 1 && scratchBytes < bytes) {
     if (scratch) cudaFree(scratch);
-    cudaMalloc(&scratch, bytes);
+    if (cudaMalloc(&scratch, bytes) != cudaSuccess) {
+      fprintf(stderr, "sweep: cannot allocate %zu bytes of scratch\n", bytes);
+      abort();
+    }
     scratchBytes = bytes;
   }
   const double* src = d_in;

@@ -6,6 +6,8 @@
 //           + 0.03125 * (u[i-1,j-1] + u[i-1,j] + u[i-1,j+1] + u[i,j-1])
 // for 1 <= i,j <= N-2; the boundary ring is copied unchanged.
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include "reference.h"
@@ -46,7 +48,10 @@ __global__ void ref_step(const double* __restrict__ u, double* __restrict__ v, i
 void reference_gpu(const double* d_in, double* d_out, int N, int T) {
   size_t bytes = sizeof(double) * (size_t)N * N;
   double* tmp = nullptr;
-  cudaMalloc(&tmp, bytes);
+  if (cudaMalloc(&tmp, bytes) != cudaSuccess) {
+    fprintf(stderr, "reference_gpu: cannot allocate %zu bytes\n", bytes);
+    abort();
+  }
   dim3 blk(32, 8), grd((N + 31) / 32, (N + 7) / 8);
   // ping-pong so that the final step lands in d_out
   const double* src = d_in;
