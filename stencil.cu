@@ -48,6 +48,9 @@ constexpr double C2 = 0.03125;  // row i-1 (3 points) and (i, j-1)
 #ifndef LDSAHEAD
 #define LDSAHEAD 1
 #endif
+#ifndef NBSYNC
+#define NBSYNC 0
+#endif
 #ifndef SPLITBAR
 #define SPLITBAR 0
 #endif
@@ -225,6 +228,24 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
   auto bar_arrive = [&]() { barTok = mbar_arrive(&sBar); };
   auto bar_wait = [&]() { mbar_wait(&sBar, barTok); };
   if (SPLITBAR) bar_arrive();
+  // neighbour-only synchronisation (NBSYNC): per-warp progress flags in shared memory
+  __shared__ volatile int sFlag[B / 32 + 2];
+  const int wid = t >> 5, lane = t & 31;
+  if (NBSYNC) {
+    if (t < B / 32 + 2) sFlag[t] = (t == 0 || t == B / 32 + 1) ? 0x7fffffff : 0;
+    __syncthreads();
+  }
+  auto nb_wait = [&](int it) {  // neighbours finished iteration it-1
+    if (lane == 0) {
+      while (sFlag[wid] < it || sFlag[wid + 2] < it) { }
+      __threadfence_block();
+    }
+    __syncwarp();
+  };
+  auto nb_signal = [&](int it) {  // this warp finished iteration it
+    __syncwarp();
+    if (lane == 0) { __threadfence_block(); sFlag[wid + 1] = it + 1; }
+  };
   // warp-uniform: does this warp hold boundary column 0 or N-1 (aligned strips)?
   const bool warpBnd = __any_sync(0xffffffffu, hasL || hasR);
 
@@ -304,6 +325,7 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
       }
     } else {
     if (SPLITBAR) bar_wait();
+    if (NBSYNC) nb_wait(it);
     // neighbour edges are loaded one level ahead: the compiler cannot move these loads above
     // the previous level's shared-memory stores by itself (possible aliasing)
     double nxl = SR(cur, K - 1, t), nxr = SL(cur, K - 1, t + 2);
@@ -376,6 +398,7 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
     slot = (slot + 1 == PF) ? 0 : slot + 1;
 #ifndef NOSYNC
     if (SPLITBAR) bar_arrive();
+    else if (NBSYNC) nb_signal(it);
     else __syncthreads();
 #endif
   };
@@ -442,6 +465,7 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
     for (int j = 0; j < n; ++j, ++it) step(it, it & 1);  // each step ends with __syncthreads
     if (ctlOwn != nullptr) {
       if (SPLITBAR) { bar_wait(); bar_arrive(); }  // make thread 0's sHi write visible
+      if (NBSYNC) __syncthreads();
       hi = sHi[par]; flV = sFl[par] != 0; par ^= 1;
     }
   }
