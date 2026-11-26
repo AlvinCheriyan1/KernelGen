@@ -45,6 +45,9 @@ constexpr double C2 = 0.03125;  // row i-1 (3 points) and (i, j-1)
 #ifndef MINSTEAL
 #define MINSTEAL 32 // minimum rows worth stealing
 #endif
+#ifndef LDSAHEAD
+#define LDSAHEAD 1
+#endif
 #ifndef SPLITBAR
 #define SPLITBAR 0
 #endif
@@ -301,13 +304,17 @@ __device__ __forceinline__ int pass_body(const double* __restrict__ in, double* 
       }
     } else {
     if (SPLITBAR) bar_wait();
+    // neighbour edges are loaded one level ahead: the compiler cannot move these loads above
+    // the previous level's shared-memory stores by itself (possible aliasing)
+    double nxl = SR(cur, K - 1, t), nxr = SL(cur, K - 1, t + 2);
 #pragma unroll
     for (int s = K; s >= 1; --s) {
       double x[C];
 #pragma unroll
       for (int q = 0; q < C; ++q) x[q] = pend[s - 1][q];
-      const double xl = SR(cur, s - 1, t);      // left neighbour's last column
-      const double xr = SL(cur, s - 1, t + 2);  // right neighbour's first column
+      const double xl = LDSAHEAD ? nxl : SR(cur, s - 1, t);      // left neighbour's last column
+      const double xr = LDSAHEAD ? nxr : SL(cur, s - 1, t + 2);  // right neighbour's first column
+      if (LDSAHEAD && s > 1) { nxl = SR(cur, s - 2, t); nxr = SL(cur, s - 2, t + 2); }
       const int a = rs + it - 1 - 2 * (s - 1);  // row index of the arriving row x
       const bool rIm1 = (a - 1 >= 1) && (a - 1 <= N - 2);
       const bool rI0 = (a >= 1) && (a <= N - 2);
