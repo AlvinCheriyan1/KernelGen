@@ -145,4 +145,29 @@ median 906.742 ms  ->  74.0 GCell/s
 OVERALL: PASS
 ```
 
-FULL_A100_SECTION
+### Full A100 80GB: NOT measured
+
+All work ran between 23:33 and 05:13. For that whole time no full A100 became available. I held
+a 1-GPU A100 request for over 4 hours; it stayed pending (`Priority`) behind 100+ jobs in the
+`gpu-a100` partition, which was fully allocated to multi-day jobs. So the "Full A100" column
+above is empty, and I could not verify the N=16384, T=1000 workload end to end on the target
+GPU. On MIG I verified N up to 10001 (even and odd), and N=8192 with T=1000.
+
+Expectation, not a measurement: the full card has 7.7× the SMs of the slice at the same clock
+and relatively more HBM bandwidth per SM. Scaling the MIG compute rate per SM gives about
+74.0 × 108/14 ≈ 570 GCell/s, i.e. ~0.47 s for the full workload. Treat that as an upper-end
+estimate until it is measured.
+
+A batch job (`tools/a100_final.sbatch`, job 24283235) is queued. It runs `./bench`: all checks,
+the full-workload check against the reference, and 2 warmup + 7 timed runs. It then times
+v1–v8 on the full workload. Output goes to `builds/a100_final_<jobid>.out`; copy the
+`./bench` output here when it finishes.
+
+### Stop condition
+
+**The 6-hour wall-clock limit** (started 23:33:22, stopped 05:13). The convergence conditions
+could not be evaluated because they are defined on full-A100 medians. On MIG, the last attempts
+were: LDS one level ahead +3.6%, then LDS two levels ahead −2%, prefetch depth/chunk size ±0%,
+neighbour flags −20%, unroll-by-2 −10% or worse. Two of those had already reached diminishing
+returns, and the "what limits it" section above explains the remaining gap to peak.
+
