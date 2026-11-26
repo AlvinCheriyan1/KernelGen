@@ -101,6 +101,12 @@ versions with each other. Full = A100 80GB, N=16384, T=1000, median of 7.
   61 vs 71 GCell/s. It is left in the code behind `SPLITBAR` (off). A probe without per-row
   barriers suggested they cost about 6% of compute time.
 * K=6 (60.1), K=9 (70.2, spills), K=12 with 256 threads (64.6) vs K=8 (70.5) on MIG.
+* Neighbour-only synchronisation (per-warp progress flags in shared memory, each warp waits only
+  for the two adjacent warps): correct, but the spin-waits cost more than the barrier
+  (58.9 vs 74.0). Left in the code behind `NBSYNC` (off).
+* Loading neighbour edges two levels ahead instead of one: 72.6 vs 74.0.
+* Prefetch depth 6 (73.3) vs 8 (74.0); depth 12 does not fit in the 163 KB of shared memory.
+  Claim chunk of 64 rows instead of 32: no change.
 * A first dynamic-scheduling version that checked the claim every row: about 10% slower per block
   (thread-0 atomic before the barrier, plus an LDS after it). The fix was to check once per 16
   rows.
