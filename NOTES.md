@@ -66,19 +66,20 @@ block that runs out of work steals the back half of the largest remaining piece 
 ## Versions and measurements
 
 MIG = A100 1g.5gb slice (14 SMs), N=8192, T=240 or 360, median of 3. Use these only to compare
-versions with each other. Full = A100 80GB, N=16384, T=1000, median of 7.
+versions with each other. Full = full A100 (SXM4-40GB, 108 SMs; the only full A100 the `gpu`
+partition gave), N=16384, T=1000, median of 7, GCell/s.
 
 | version | change | MIG GCell/s | full A100 |
 |---|---|---|---|
-| v1 | streaming temporal blocking, K=12, 128 thr ×2 blocks/SM, 1-row register prefetch | 54.8 | (not measured) |
-| v2 | cp.async 4-row prefetch ring | 57.0 | |
-| v3 | K=8, 3 blocks/SM (sweep of K/B/occupancy) | 60.7 | |
-| v4 | pair-sum row sums (7 → 6.5 ops/cell) | 61.7 | |
-| v5 | per-iteration row-fast path (before this, whole boundary-touching blocks ran the slow path) | 66.5 | |
-| v6 | 384-thread blocks, 1 block/SM, boundary-aligned strips, static balanced split | 70.3 | |
-| v7 | dynamic chunk claiming + work stealing, warp-level boundary variant | 70.5 | |
-| v8 | cp.async prefetch depth 8 rows | 71.4 | |
-| v9 | neighbour-edge LDS issued one level ahead (compiler could not hoist them over the previous level's STS: possible aliasing) | 74.0 | |
+| v1 | streaming temporal blocking, K=12, 128 thr ×2 blocks/SM, 1-row register prefetch | 54.8 | 336.7 |
+| v2 | cp.async 4-row prefetch ring | 57.0 | 350.7 |
+| v3 | K=8, 3 blocks/SM (sweep of K/B/occupancy) | 60.7 | 467.5 |
+| v4 | pair-sum row sums (7 → 6.5 ops/cell) | 61.7 | 468.3 |
+| v5 | per-iteration row-fast path (before this, whole boundary-touching blocks ran the slow path) | 66.5 | 491.8 |
+| v6 | 384-thread blocks, 1 block/SM, boundary-aligned strips, static balanced split | 70.3 | 530.5 |
+| v7 | dynamic chunk claiming + work stealing, warp-level boundary variant | 70.5 | 533.9 |
+| v8 | cp.async prefetch depth 8 rows | 71.4 | 540.8 |
+| v9 | neighbour-edge LDS issued one level ahead (compiler could not hoist them over the previous level's STS: possible aliasing) | 74.0 | 551.7 |
 
 ## Things that did not help (MIG measurements)
 
@@ -145,28 +146,31 @@ median 906.742 ms  ->  74.0 GCell/s
 OVERALL: PASS
 ```
 
-### Full A100 80GB: NOT measured
+### Full A100 measurement (job 24283235, ran 2026-11-27 03:57 on gpu-b11-1)
 
-All work ran between 23:33 and 05:13. For that whole time no full A100 became available. I held
-a 1-GPU A100 request for over 4 hours; it stayed pending (`Priority`) behind 100+ jobs in the
-`gpu-a100` partition, which was fully allocated to multi-day jobs. So the "Full A100" column
-above is empty, and I could not verify the N=16384, T=1000 workload end to end on the target
-GPU. On MIG I verified N up to 10001 (even and odd), and N=8192 with T=1000.
+The batch job queued at the end of the session ran the next night. The card was an
+A100-SXM4-40GB (108 SMs), not the 80 GB model; the `gpu`/`gpu-a100` partitions did not give an
+80 GB card. Output of `./bench` (all checks + full workload + 2 warmup / 7 timed runs):
 
-Expectation, not a measurement: the full card has 7.7× the SMs of the slice at the same clock
-and relatively more HBM bandwidth per SM. Scaling the MIG compute rate per SM gives about
-74.0 × 108/14 ≈ 570 GCell/s, i.e. ~0.47 s for the full workload. Treat that as an upper-end
-estimate until it is measured.
+```
+device: NVIDIA A100-SXM4-40GB, 108 SMs, 42.4 GB
+small-grid checks: 462 cases, 0 failures -> PASS
+medium-grid checks: 105 cases, 0 failures -> PASS
+full-workload check (N=16384, T=1000) vs GPU reference:
+  N=16384 T=1000 maxerr=2.331e-15 boundary=exact d_in=unchanged finite=yes -> PASS
+timing N=16384 T=1000 runs(ms): 486.46 484.09 486.95 484.97 487.12 485.28 487.51
+median 486.458 ms  ->  551.7 GCell/s
+OVERALL: PASS
+```
 
-A batch job (`tools/a100_final.sbatch`, job 24283235) is queued. It runs `./bench`: all checks,
-the full-workload check against the reference, and 2 warmup + 7 timed runs. It then times
-v1–v8 on the full workload. Output goes to `builds/a100_final_<jobid>.out`; copy the
-`./bench` output here when it finishes.
+**Final: 486.5 ms, 551.7 GCell/s** (the MIG-based estimate was ~570). Earlier versions on the same
+card are in the "full A100" column of the version table.
 
 ### Stop condition
 
-**The 6-hour wall-clock limit** (started 23:33:22, stopped 05:13). The convergence conditions
-could not be evaluated because they are defined on full-A100 medians. On MIG, the last attempts
+**The 6-hour wall-clock limit** (started 23:33:22, stopped 05:13). The full-A100 medians that
+arrived later show the convergence condition was also nearly met: v7 +0.6%, v8 +1.3%, v9 +2.0%
+over the previous version. On MIG, the last attempts
 were: LDS one level ahead +3.6%, then LDS two levels ahead −2%, prefetch depth/chunk size ±0%,
 neighbour flags −20%, unroll-by-2 −10% or worse. Two of those had already reached diminishing
 returns, and the "what limits it" section above explains the remaining gap to peak.
