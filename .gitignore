@@ -1,6 +1,9 @@
+# build products (each problem builds into problems/<problem>/build/)
+build/
 *.o
-bench
-bench_*
 *.sass
 ptxas.log
-builds/
+# compiled microbenchmarks
+common/microbench/*
+!common/microbench/*.cu
+!common/microbench/README.md

@@ -2,9 +2,11 @@
 
 Start time: **Wed Nov 25 23:33:22 EST 2026** (from `date` at the start of the work).
 
-Files: `stencil.cu` (kernel + `sweep`), `reference.cu` (naive CPU and GPU references),
-`bench.cu` (checks + timing), `build.sh` (builds `./bench`). `tools/` has the helper scripts and
-microbenchmarks used during tuning (`dpeak*.cu`, `mkvar.sh`).
+Files: `stencil.cu` here (kernel + `sweep`). The shared harness is in `../../harness/`:
+`reference.cu` (naive CPU and GPU references) and `bench.cu` (checks + timing). Build with
+`../../build.sh streaming-tb`. `results/` holds the final bench outputs; the microbenchmarks
+used during tuning are in `common/microbench/` at the repo root. Old version binaries (gitignored)
+are in `../../build/streaming-tb/versions/`.
 
 ## Design (final version)
 
