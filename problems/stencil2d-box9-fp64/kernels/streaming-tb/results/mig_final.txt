@@ -1,0 +1,9 @@
+srun: job 24279939 has been allocated resources
+device: NVIDIA A100-SXM4-40GB MIG 1g.5gb, 14 SMs, 5.1 GB
+small-grid checks: 462 cases, 0 failures -> PASS
+medium-grid checks: 105 cases, 0 failures -> PASS
+full-workload check (N=8192, T=1000) vs GPU reference:
+  N= 8192 T=1000 maxerr=2.331e-15 boundary=exact d_in=unchanged finite=yes -> PASS
+timing N=8192 T=1000 runs(ms): 906.73 906.74 906.76 906.75 906.72 906.70 906.75
+median 906.742 ms  ->  74.0 GCell/s
+OVERALL: PASS

@@ -1,0 +1,20 @@
+name, memory.total [MiB]
+NVIDIA A100-SXM4-40GB, 40960 MiB
+### final ./bench
+device: NVIDIA A100-SXM4-40GB, 108 SMs, 42.4 GB
+small-grid checks: 462 cases, 0 failures -> PASS
+medium-grid checks: 105 cases, 0 failures -> PASS
+full-workload check (N=16384, T=1000) vs GPU reference:
+  N=16384 T=1000 maxerr=2.331e-15 boundary=exact d_in=unchanged finite=yes -> PASS
+timing N=16384 T=1000 runs(ms): 486.46 484.09 486.95 484.97 487.12 485.28 487.51
+median 486.458 ms  ->  551.7 GCell/s
+OVERALL: PASS
+### versions (N=16384, T=1000, median of 7)
+v1: median 797.017 ms  ->  336.7 GCell/s
+v2: median 765.334 ms  ->  350.7 GCell/s
+v3: median 574.097 ms  ->  467.5 GCell/s
+v4: median 573.037 ms  ->  468.3 GCell/s
+v5: median 545.679 ms  ->  491.8 GCell/s
+v6: median 505.851 ms  ->  530.5 GCell/s
+v7: median 502.637 ms  ->  533.9 GCell/s
+v8: median 496.265 ms  ->  540.8 GCell/s
