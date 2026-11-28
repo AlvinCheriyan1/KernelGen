@@ -1,0 +1,6 @@
+*.o
+bench
+bench_*
+*.sass
+ptxas.log
+builds/
